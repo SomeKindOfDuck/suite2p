@@ -320,8 +320,6 @@ def make_cross_view_marker(M, ycirc, xcirc):
 
     offsets = [
         (0, 0),
-        (1, 0), (-1, 0),
-        (0, 1), (0, -1),
     ]
 
     for dy, dx in offsets:
@@ -332,9 +330,9 @@ def make_cross_view_marker(M, ycirc, xcirc):
             (x >= 0) & (x < Lx)
         )
         M[y[valid], x[valid], 0] = 255
-        M[y[valid], x[valid], 1] = 255
-        M[y[valid], x[valid], 2] = 255
-        M[y[valid], x[valid], 3] = 150
+        M[y[valid], x[valid], 1] = 0
+        M[y[valid], x[valid], 2] = 0
+        M[y[valid], x[valid], 3] = 255
 
     return M
 
