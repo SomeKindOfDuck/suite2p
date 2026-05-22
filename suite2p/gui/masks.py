@@ -292,6 +292,52 @@ def rgb_masks(parent, col, c):
         parent.colors["RGB"][i, c, :, :, :3] = H
 
 
+def make_cross_view_marker(M, ycirc, xcirc):
+    """Draw a dashed outline of the selected ROI on the opposite view."""
+    ycirc = np.asarray(ycirc).astype(np.int32)
+    xcirc = np.asarray(xcirc).astype(np.int32)
+
+    if ycirc.size == 0 or xcirc.size == 0:
+        return M
+
+    Ly, Lx = M.shape[:2]
+
+    valid = (
+        (ycirc >= 0) & (ycirc < Ly) &
+        (xcirc >= 0) & (xcirc < Lx)
+    )
+    ycirc = ycirc[valid]
+    xcirc = xcirc[valid]
+
+    if ycirc.size == 0:
+        return M
+
+    dash = 4
+    gap = 4
+    keep = (np.arange(ycirc.size) % (dash + gap)) < dash
+    ycirc = ycirc[keep]
+    xcirc = xcirc[keep]
+
+    offsets = [
+        (0, 0),
+        (1, 0), (-1, 0),
+        (0, 1), (0, -1),
+    ]
+
+    for dy, dx in offsets:
+        y = ycirc + dy
+        x = xcirc + dx
+        valid = (
+            (y >= 0) & (y < Ly) &
+            (x >= 0) & (x < Lx)
+        )
+        M[y[valid], x[valid], 0] = 255
+        M[y[valid], x[valid], 1] = 255
+        M[y[valid], x[valid], 2] = 255
+        M[y[valid], x[valid], 3] = 150
+
+    return M
+
 def draw_masks(parent):  #settings, stat, settings_plot, iscell, ichosen):
     """
 
@@ -326,24 +372,42 @@ def draw_masks(parent):  #settings, stat, settings_plot, iscell, ichosen):
 
     if view == 0:
         for n in parent.imerge:
+            selected_plot = int(1 - parent.iscell[n])
+            opposite_plot = 1 - selected_plot
+
             ypix = parent.stat[n]["ypix"].flatten()
             xpix = parent.stat[n]["xpix"].flatten()
-            v = (parent.rois["iROI"][wplot][:, ypix, xpix] > -1).sum(axis=0) - 1
+
+            v = (parent.rois["iROI"][selected_plot][:, ypix, xpix] > -1).sum(axis=0) - 1
             v = 1 - v / 3
-            M[wplot] = make_chosen_ROI(M[wplot], ypix, xpix, v)
+
+            # normal highlight on the original view
+            M[selected_plot] = make_chosen_ROI(M[selected_plot], ypix, xpix, v)
+
+            # dashed ghost marker on the opposite view
+            if "ycirc" in parent.stat[n] and "xcirc" in parent.stat[n]:
+                ycirc = parent.stat[n]["ycirc"]
+                xcirc = parent.stat[n]["xcirc"]
+                M[opposite_plot] = make_cross_view_marker(M[opposite_plot], ycirc, xcirc)
+
     else:
         for n in parent.imerge:
+            selected_plot = int(1 - parent.iscell[n])
+            opposite_plot = 1 - selected_plot
+
             ycirc = parent.stat[n]["ycirc"]
             xcirc = parent.stat[n]["xcirc"]
             ypix = parent.stat[n]["ypix"].flatten()
             xpix = parent.stat[n]["xpix"].flatten()
-            M[wplot][ypix, xpix, 3] = 0
+
+            M[selected_plot][ypix, xpix, 3] = 0
             col = parent.colors["cols"][color, n]
             sat = 1
-            M[wplot] = make_chosen_circle(M[wplot], ycirc, xcirc, col, sat)
+            
+            M[selected_plot] = make_chosen_circle(M[selected_plot], ycirc, xcirc, col, sat)
+            M[opposite_plot] = make_cross_view_marker(M[opposite_plot], ycirc, xcirc)
 
     return M[0], M[1]
-
 
 def make_chosen_ROI(M0, ypix, xpix, v):
     M0[ypix, xpix, :] = np.tile((255 * v[:, np.newaxis]).astype(np.uint8), (1, 4))
