@@ -108,6 +108,9 @@ class MainWindow(QMainWindow):
         model = np.load(self.classorig, allow_pickle=True).item()
         self.default_keys = model["keys"]
 
+        self.merged_view = False
+        self.merged_view_mode = 0
+        self._pre_merged_size_id = 1
         
         # load initial file
         if statfile is not None:
@@ -408,8 +411,14 @@ class MainWindow(QMainWindow):
         masks.plot_colorbar(self)
         self.ichosen_stats()
         views.plot_views(self)
-        M = masks.draw_masks(self)
-        masks.plot_masks(self, M)
+
+        if getattr(self, "merged_view", False):
+            M = masks.draw_merged_masks(self)
+            masks.plot_merged_mask(self, M)
+        else:
+            M = masks.draw_masks(self)
+            masks.plot_masks(self, M)
+
         traces.plot_trace(self)
         if self.zoomtocell:
             self.zoom_to_cell()

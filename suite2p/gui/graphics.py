@@ -61,7 +61,10 @@ class ViewBox(pg.ViewBox):
             else:
                 iplot = 1
             if posy >= 0 and posx >= 0 and posy <= self.parent.Lx and posx <= self.parent.Ly:
-                ichosen = int(self.parent.rois["iROI"][iplot, 0, posx, posy])
+                if getattr(self.parent, "merged_view", False) and self.name == "plot1":
+                    ichosen = masks.merged_roi_at_pixel(self.parent, posx, posy)
+                else:
+                    ichosen = int(self.parent.rois["iROI"][iplot, 0, posx, posy])
                 if ichosen < 0:
                     if ev.button() == QtCore.Qt.RightButton and self.menuEnabled():
                         self.raiseContextMenu(ev)

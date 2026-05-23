@@ -8,7 +8,7 @@ from scipy.ndimage import gaussian_filter1d
 from qtpy import QtGui
 from qtpy.QtWidgets import QFileDialog, QMessageBox
 
-from . import utils, masks, views, graphics, traces, classgui
+from . import utils, masks, views, graphics, traces, classgui, buttons
 from .. import io
 
 
@@ -149,6 +149,8 @@ def enable_views_and_classifier(parent):
             btn.setStyleSheet(parent.stylePressed)
             btn.press(parent)
         b += 1
+
+    buttons.set_merged_view_buttons_enabled(parent, True)
     for b in range(3):
         if b == 0:
             parent.topbtns.button(b).setEnabled(True)

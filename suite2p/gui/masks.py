@@ -709,3 +709,126 @@ class ColorButton(QPushButton):
                 parent.topbtns.button(b).setStyleSheet(parent.styleInactive)
         parent.update_plot()
         parent.show()
+
+def draw_outline(M, ycirc, xcirc, color=(255, 0, 0), alpha=255, width=1):
+    ycirc = np.asarray(ycirc).astype(np.int32)
+    xcirc = np.asarray(xcirc).astype(np.int32)
+
+    if ycirc.size == 0:
+        return M
+
+    Ly, Lx = M.shape[:2]
+
+    offsets = [(0, 0)]
+    if width >= 2:
+        offsets += [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    if width >= 3:
+        offsets += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+
+    for dy, dx in offsets:
+        y = ycirc + dy
+        x = xcirc + dx
+        valid = (y >= 0) & (y < Ly) & (x >= 0) & (x < Lx)
+
+        M[y[valid], x[valid], 0] = color[0]
+        M[y[valid], x[valid], 1] = color[1]
+        M[y[valid], x[valid], 2] = color[2]
+        M[y[valid], x[valid], 3] = alpha
+
+    return M
+
+
+def draw_merged_masks(parent):
+    color = parent.ops_plot["color"]
+    mask_alpha = parent.ops_plot["opacity"][0]
+    Ly, Lx = parent.Ly, parent.Lx
+
+    # reset alpha
+    for i in range(2):
+        parent.colors["RGB"][i, color, :, :, 3] = (
+            mask_alpha
+            * parent.rois["Sroi"][i]
+            * parent.rois["LamNorm"][i]
+        ).astype(np.uint8)
+
+    M = np.zeros((Ly, Lx, 4), np.uint8)
+
+    if not parent.ops_plot["ROIs_on"]:
+        return M
+
+    mode = getattr(parent, "merged_view_mode", 0)
+
+    if mode == 0:
+        # cells = mask
+        M = np.array(parent.colors["RGB"][0, color])
+
+        # not cells = red outline
+        for n in np.where(~parent.iscell)[0]:
+            if "ycirc" in parent.stat[n] and "xcirc" in parent.stat[n]:
+                M = draw_outline(
+                    M,
+                    parent.stat[n]["ycirc"],
+                    parent.stat[n]["xcirc"],
+                    color=(255, 0, 0),
+                    alpha=255,
+                    width=1,
+                )
+
+    else:
+        # not cells = mask
+        M = np.array(parent.colors["RGB"][1, color])
+
+        # cells = blue outline
+        for n in np.where(parent.iscell)[0]:
+            if "ycirc" in parent.stat[n] and "xcirc" in parent.stat[n]:
+                M = draw_outline(
+                    M,
+                    parent.stat[n]["ycirc"],
+                    parent.stat[n]["xcirc"],
+                    color=(0, 120, 255),
+                    alpha=255,
+                    width=1,
+                )
+
+    # selected ROI = green outline
+    for n in parent.imerge:
+        if "ycirc" in parent.stat[n] and "xcirc" in parent.stat[n]:
+            M = draw_outline(
+                M,
+                parent.stat[n]["ycirc"],
+                parent.stat[n]["xcirc"],
+                color=(0, 255, 0),
+                alpha=255,
+                width=2,
+            )
+
+    return M
+
+
+def plot_merged_mask(parent, M):
+    parent.color1.setImage(M, levels=(0., 255.))
+    parent.color1.show()
+
+    # p2 is hidden, but clear its overlay to avoid stale images
+    parent.color2.clear()
+    parent.color2.hide()
+
+
+def merged_roi_at_pixel(parent, posx, posy):
+    """Return ROI index at pixel in merged view."""
+    if posx < 0 or posy < 0 or posx >= parent.Ly or posy >= parent.Lx:
+        return -1
+
+    mode = getattr(parent, "merged_view_mode", 0)
+
+    # mode 0: cells are masks, so prefer cells
+    # mode 1: not cells are masks, so prefer not cells
+    order = [0, 1] if mode == 0 else [1, 0]
+
+    for iplot in order:
+        for layer in range(parent.rois["iROI"].shape[1]):
+            n = int(parent.rois["iROI"][iplot, layer, posx, posy])
+            if n >= 0:
+                return n
+
+    return -1

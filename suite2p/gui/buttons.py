@@ -146,6 +146,38 @@ def _update_cell_view_sync(parent, source_view=None):
         parent.win.show()
     parent.show()
 
+
+def _text_width(button, text):
+    fm = button.fontMetrics()
+    if hasattr(fm, "horizontalAdvance"):
+        return fm.horizontalAdvance(text)
+    return fm.width(text)
+
+
+def _set_fixed_width_for_texts(button, texts, padding=28):
+    width = max(_text_width(button, text) for text in texts) + padding
+    button.setMinimumWidth(width)
+    button.setMaximumWidth(width)
+
+
+def set_merged_view_buttons_enabled(parent, enabled):
+    """Enable merged-view buttons only after ROI data are loaded."""
+    if not hasattr(parent, "mergedViewButton"):
+        return
+
+    parent.mergedViewButton.setEnabled(enabled)
+    parent.mergedViewButton.setStyleSheet(
+        parent.styleUnpressed if enabled else parent.styleInactive
+    )
+
+    # mode button is enabled only while merged view itself is active
+    mode_enabled = enabled and getattr(parent, "merged_view", False)
+    parent.mergedModeButton.setEnabled(mode_enabled)
+    parent.mergedModeButton.setStyleSheet(
+        parent.styleUnpressed if mode_enabled else parent.styleInactive
+    )
+
+
 # minimize view
 def make_cellnotcell(parent):
     """ buttons for cell / not cell views at top """
@@ -179,6 +211,56 @@ def make_cellnotcell(parent):
         lambda _: _update_cell_view_sync(parent)
     )
     parent.l0.addWidget(parent.syncViewsCheckBox, 0, 22, 1, 4)
+
+    parent.mergedViewButton = QPushButton(" merged")
+    parent.mergedViewButton.setCheckable(True)
+    parent.mergedViewButton.setFont(QtGui.QFont("Arial", 8, QtGui.QFont.Bold))
+    parent.mergedViewButton.clicked.connect(lambda: toggle_merged_view(parent))
+    parent.l0.addWidget(parent.mergedViewButton, 0, 26, 1, 2)
+
+    parent.mergedModeButton = QPushButton(" cells mask")
+    parent.mergedModeButton.setFont(QtGui.QFont("Arial", 8, QtGui.QFont.Bold))
+    _set_fixed_width_for_texts(
+        parent.mergedModeButton,
+        [" cells mask", " not-cells mask"],
+    )
+    parent.mergedModeButton.clicked.connect(lambda: toggle_merged_mode(parent))
+    parent.l0.addWidget(parent.mergedModeButton, 0, 28, 1, 2)
+
+    # no data loaded yet, so keep them inactive like cells/both/not-cells buttons
+    set_merged_view_buttons_enabled(parent, False)
+
+
+def toggle_merged_view(parent):
+    if not getattr(parent, "loaded", False):
+        parent.mergedViewButton.setChecked(False)
+        set_merged_view_buttons_enabled(parent, False)
+        return
+
+    parent.merged_view = parent.mergedViewButton.isChecked()
+
+    if parent.merged_view:
+        parent._pre_merged_size_id = parent.sizebtns.checkedId()
+        parent.win.ci.layout.setColumnStretchFactor(0, 100)
+        parent.win.ci.layout.setColumnStretchFactor(1, 0)
+    else:
+        bid = getattr(parent, "_pre_merged_size_id", 1)
+        if bid < 0:
+            bid = 1
+        parent.sizebtns.button(bid).setChecked(True)
+        parent.sizebtns.button(bid).press(parent)
+
+    set_merged_view_buttons_enabled(parent, True)
+    parent.update_plot()
+    
+
+def toggle_merged_mode(parent):
+    parent.merged_view_mode = 1 - int(parent.merged_view_mode)
+    if parent.merged_view_mode == 0:
+        parent.mergedModeButton.setText(" cells mask")
+    else:
+        parent.mergedModeButton.setText(" not-cells mask")
+    parent.update_plot()
 
 
 def make_quadrants(parent):
