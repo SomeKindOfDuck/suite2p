@@ -667,3 +667,66 @@ class ColorButton(QPushButton):
                 parent.topbtns.button(b).setStyleSheet(parent.styleInactive)
         parent.update_plot()
         parent.show()
+
+def draw_outline(M, ycirc, xcirc, color=(255, 0, 0), alpha=255, width=1):
+    ycirc = np.asarray(ycirc).astype(np.int32)
+    xcirc = np.asarray(xcirc).astype(np.int32)
+    if ycirc.size == 0 or xcirc.size == 0:
+        return M
+    Ly, Lx = M.shape[:2]
+    offsets = [(0, 0)]
+    if width >= 2:
+        offsets += [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    for dy, dx in offsets:
+        y = ycirc + dy
+        x = xcirc + dx
+        valid = (y >= 0) & (y < Ly) & (x >= 0) & (x < Lx)
+        M[y[valid], x[valid], 0] = color[0]
+        M[y[valid], x[valid], 1] = color[1]
+        M[y[valid], x[valid], 2] = color[2]
+        M[y[valid], x[valid], 3] = alpha
+    return M
+
+def draw_merged_masks(parent):
+    M = draw_masks(parent)
+    if parent.merged_view_mode == 0:
+        M0 = M[0].copy()
+        for n in np.where(~parent.iscell)[0]:
+            M0 = draw_outline(
+                M0,
+                parent.stat[n]["ycirc"],
+                parent.stat[n]["xcirc"],
+                color=(255, 0, 0),
+                alpha=255,
+                width=1,
+            )
+    else:
+        M0 = M[1].copy()
+        for n in np.where(parent.iscell)[0]:
+            M0 = draw_outline(
+                M0,
+                parent.stat[n]["ycirc"],
+                parent.stat[n]["xcirc"],
+                color=(0, 0, 255),
+                alpha=255,
+                width=1,
+            )
+    for n in parent.imerge:
+        M0 = draw_outline(
+            M0,
+            parent.stat[n]["ycirc"],
+            parent.stat[n]["xcirc"],
+            color=(0, 255, 0),
+            alpha=255,
+            width=1,
+        )
+    return M0
+
+def plot_merged_mask(parent, M):
+    parent.color1.show()
+    parent.color2.show()
+    if parent.merged_view_mode == 0:
+        parent.color1.setImage(M, levels=(0.0, 255.0))
+
+    else:
+        parent.color2.setImage(M, levels=(0.0, 255.0))
