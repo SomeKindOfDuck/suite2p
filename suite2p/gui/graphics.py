@@ -61,17 +61,25 @@ class ViewBox(pg.ViewBox):
             else:
                 iplot = 1
             if posy >= 0 and posx >= 0 and posy <= self.parent.Lx and posx <= self.parent.Ly:
-                ichosen = int(self.parent.rois["iROI"][iplot, 0, posx, posy])
+                if self.parent.merged_view:
+                    visible_plot = "plot1" if self.parent.merged_view_mode == 0 else "plot2"
+                    if self.name != visible_plot:
+                        return
+                    ichosen = merged_roi_at_pixel(self.parent, posx, posy)
+                else:
+                    ichosen = int(self.parent.rois["iROI"][iplot, 0, posx, posy])
                 if ichosen < 0:
                     if ev.button() == QtCore.Qt.RightButton and self.menuEnabled():
                         self.raiseContextMenu(ev)
                     return
                 else:
                     if ev.button() == QtCore.Qt.RightButton:
-                        if ichosen not in self.parent.imerge:
-                            self.parent.imerge = [ichosen]
-                            self.parent.ichosen = ichosen
+                        self.parent.imerge = [ichosen]
+                        self.parent.ichosen = ichosen
                         masks.flip_plot(self.parent)
+                        self.parent.imerge = []
+                        self.parent.ichosen = -1
+                        self.parent.update_plot()
                     else:
                         merged = False
                         if ev.modifiers() == QtCore.Qt.ShiftModifier or ev.modifiers(
@@ -128,3 +136,25 @@ def ROI_index(settings, stat):
             xpix = stat[n]["xpix"][~stat[n]["overlap"]]
             iROI[ypix, xpix] = n
     return iROI
+
+def _outline_contains_pixel(stat, ypix, xpix, width=1):
+    if "ycirc" not in stat or "xcirc" not in stat:
+        return False
+    ycirc = np.asarray(stat["ycirc"])
+    xcirc = np.asarray(stat["xcirc"])
+    return np.any(
+        (np.abs(ycirc - ypix) <= width)
+        & (np.abs(xcirc - xpix) <= width)
+    )
+
+def merged_roi_at_pixel(parent, ypix, xpix):
+    if parent.merged_view_mode == 0:
+        iplot = 0
+        outline_rois = np.where(~parent.iscell)[0]
+    else:
+        iplot = 1
+        outline_rois = np.where(parent.iscell)[0]
+    for n in outline_rois:
+        if _outline_contains_pixel(parent.stat[n], ypix, xpix):
+            return int(n)
+    return int(parent.rois["iROI"][iplot, 0, ypix, xpix])

@@ -408,8 +408,12 @@ class MainWindow(QMainWindow):
         masks.plot_colorbar(self)
         self.ichosen_stats()
         views.plot_views(self)
-        M = masks.draw_masks(self)
-        masks.plot_masks(self, M)
+        if self.merged_view:
+            M = masks.draw_merged_masks(self)
+            masks.plot_merged_mask(self, M)
+        else:
+            M = masks.draw_masks(self)
+            masks.plot_masks(self, M)
         traces.plot_trace(self)
         if self.zoomtocell:
             self.zoom_to_cell()
