@@ -687,27 +687,37 @@ def draw_outline(M, ycirc, xcirc, color=(255, 0, 0), alpha=255, width=1):
         M[y[valid], x[valid], 3] = alpha
     return M
 
+def roi_outline_color(parent, color_id, roi_id, fallback=(255, 0, 0)):
+    """Return the currently selected ROI color for an outline."""
+    try:
+        return parent.colors["cols"][color_id, roi_id]
+    except (KeyError, IndexError, TypeError):
+        return np.array(fallback, dtype=np.uint8)
+
 def draw_merged_masks(parent):
     M = draw_masks(parent)
+    color = parent.ops_plot["color"]
     if parent.merged_view_mode == 0:
         M0 = M[0].copy()
         for n in np.where(~parent.iscell)[0]:
+            outline_color = roi_outline_color(parent, color, n)
             M0 = draw_outline(
                 M0,
                 parent.stat[n]["ycirc"],
                 parent.stat[n]["xcirc"],
-                color=(255, 0, 0),
+                color=outline_color,
                 alpha=255,
                 width=1,
             )
     else:
         M0 = M[1].copy()
         for n in np.where(parent.iscell)[0]:
+            outline_color = roi_outline_color(parent, color, n)
             M0 = draw_outline(
                 M0,
                 parent.stat[n]["ycirc"],
                 parent.stat[n]["xcirc"],
-                color=(0, 0, 255),
+                color=outline_color,
                 alpha=255,
                 width=1,
             )
