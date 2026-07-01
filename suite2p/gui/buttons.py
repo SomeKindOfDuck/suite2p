@@ -44,11 +44,13 @@ def make_cellnotcell(parent):
     parent.lcell0.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
     parent.l0.addWidget(parent.lcell0, 0, 12, 1, 2)
     parent.lcell1 = QLabel("")
-    parent.l0.addWidget(parent.lcell1, 0, 20, 1, 2)
+    parent.l0.addWidget(parent.lcell1, 0, 22, 1, 2)
 
     parent.sizebtns = QButtonGroup(parent)
+    parent.merged_view = False
+    parent.merged_view_mode = 0
     b = 0
-    labels = [" cells", " both", " not cells"]
+    labels = [" cells", " both", " not cells", " merged"]
     for l in labels:
         btn = SizeButton(b, l, parent)
         parent.sizebtns.addButton(btn, b)
@@ -58,7 +60,8 @@ def make_cellnotcell(parent):
             btn.setChecked(True)
         b += 1
     parent.sizebtns.setExclusive(True)
-
+    parent.mergedmaskbtn = MergedMaskButton(parent)
+    parent.l0.addWidget(parent.mergedmaskbtn, 0, 24, 1, 3)
 
 def make_quadrants(parent):
     """ make quadrant buttons """
@@ -101,8 +104,7 @@ class QuadButton(QPushButton):
         parent.p1.setYRange(self.yrange[0], self.yrange[1])
         parent.p2.setXRange(self.xrange[0], self.xrange[1])
         parent.p2.setYRange(self.yrange[0], self.yrange[1])
-        parent.p2.setXLink("plot1")
-        parent.p2.setYLink("plot1")
+        parent.update_roi_view_sync(source_view=parent.p1)
         parent.show()
 
 
@@ -123,23 +125,34 @@ class SizeButton(QPushButton):
     def press(self, parent):
         bid = self.bid
         ts = 100
+        was_merged = getattr(parent, "merged_view", False)
+        parent.merged_view = bid == 3
+        parent.mergedmaskbtn.setEnabled(parent.merged_view)
         if bid == 0:
-            parent.p2.linkView(parent.p2.XAxis, view=None)
-            parent.p2.linkView(parent.p2.YAxis, view=None)
             parent.win.ci.layout.setColumnStretchFactor(0, ts)
             parent.win.ci.layout.setColumnStretchFactor(1, 0)
+            parent.update_roi_view_sync(source_view=parent.p2)
         elif bid == 1:
             parent.win.ci.layout.setColumnStretchFactor(0, ts)
             parent.win.ci.layout.setColumnStretchFactor(1, ts)
-            parent.p2.setXLink("plot1")
-            parent.p2.setYLink("plot1")
+            parent.update_roi_view_sync(source_view=parent.p1)
         elif bid == 2:
-            parent.p2.linkView(parent.p2.XAxis, view=None)
-            parent.p2.linkView(parent.p2.YAxis, view=None)
             parent.win.ci.layout.setColumnStretchFactor(0, 0)
             parent.win.ci.layout.setColumnStretchFactor(1, ts)
-        # only enable selection buttons when not in "both" view
-        if bid != 1:
+        elif bid == 3:
+            parent.p2.linkView(parent.p2.XAxis, view=None)
+            parent.p2.linkView(parent.p2.YAxis, view=None)
+            set_merged_view_layout(parent)
+
+        parent.mergedmaskbtn.setEnabled(parent.merged_view)
+
+        if bid != 3:
+            if bid == 2:
+                parent.update_roi_view_sync(source_view=parent.p2)
+            else:
+                parent.update_roi_view_sync(source_view=parent.p1)
+        # only enable selection buttons when not in "both" or "merged" view
+        if bid not in (1, 3):
             if parent.ops_plot["color"] != 0:
                 for btn in parent.topbtns.buttons():
                     btn.setEnabled(True)
@@ -149,6 +162,8 @@ class SizeButton(QPushButton):
             parent.ROI_remove()
             for btn in parent.topbtns.buttons():
                 btn.setEnabled(False)
+        if was_merged or parent.merged_view:
+            parent.update_plot()
         parent.win.show()
         parent.show()
 
@@ -224,3 +239,31 @@ class TopButton(QPushButton):
                 # draw choices
                 parent.update_plot()
                 parent.show()
+
+class MergedMaskButton(QPushButton):
+    def __init__(self, parent=None):
+        super(MergedMaskButton, self).__init__("cell mask", parent)
+        self.setCheckable(True)
+        self.setEnabled(False)
+        self.clicked.connect(lambda checked: self.press(parent, checked))
+
+    def press(self, parent, checked):
+        parent.merged_view_mode = int(checked)
+        if parent.merged_view_mode == 0:
+            self.setText("cell mask")
+        else:
+            self.setText("not-cell mask")
+        if parent.merged_view:
+            set_merged_view_layout(parent)
+            parent.update_plot()
+        parent.win.show()
+        parent.show()
+
+def set_merged_view_layout(parent):
+    ts = 100
+    if parent.merged_view_mode == 0:
+        parent.win.ci.layout.setColumnStretchFactor(0, ts)
+        parent.win.ci.layout.setColumnStretchFactor(1, 0)
+    else:
+        parent.win.ci.layout.setColumnStretchFactor(0, 0)
+        parent.win.ci.layout.setColumnStretchFactor(1, ts)

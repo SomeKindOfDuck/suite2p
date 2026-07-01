@@ -326,13 +326,25 @@ def draw_masks(parent):  #settings, stat, settings_plot, iscell, ichosen):
 
     if view == 0:
         for n in parent.imerge:
+            wplot = int(1 - parent.iscell[n])
             ypix = parent.stat[n]["ypix"].flatten()
             xpix = parent.stat[n]["xpix"].flatten()
             v = (parent.rois["iROI"][wplot][:, ypix, xpix] > -1).sum(axis=0) - 1
             v = 1 - v / 3
             M[wplot] = make_chosen_ROI(M[wplot], ypix, xpix, v)
+            opposite_plot = 1 - wplot
+            ycirc = parent.stat[n]["ycirc"]
+            xcirc = parent.stat[n]["xcirc"]
+            M[opposite_plot] = make_chosen_circle(
+                M[opposite_plot],
+                ycirc,
+                xcirc,
+                np.array([255, 0, 0], dtype=np.uint8),
+                1,
+            )
     else:
         for n in parent.imerge:
+            wplot = int(1 - parent.iscell[n])
             ycirc = parent.stat[n]["ycirc"]
             xcirc = parent.stat[n]["xcirc"]
             ypix = parent.stat[n]["ypix"].flatten()
@@ -341,6 +353,14 @@ def draw_masks(parent):  #settings, stat, settings_plot, iscell, ichosen):
             col = parent.colors["cols"][color, n]
             sat = 1
             M[wplot] = make_chosen_circle(M[wplot], ycirc, xcirc, col, sat)
+            opposite_plot = 1 - wplot
+            M[opposite_plot] = make_chosen_circle(
+                M[opposite_plot],
+                ycirc,
+                xcirc,
+                np.array([255, 0, 0], dtype=np.uint8),
+                1,
+            )
 
     return M[0], M[1]
 
@@ -647,3 +667,76 @@ class ColorButton(QPushButton):
                 parent.topbtns.button(b).setStyleSheet(parent.styleInactive)
         parent.update_plot()
         parent.show()
+
+def draw_outline(M, ycirc, xcirc, color=(255, 0, 0), alpha=255, width=1):
+    ycirc = np.asarray(ycirc).astype(np.int32)
+    xcirc = np.asarray(xcirc).astype(np.int32)
+    if ycirc.size == 0 or xcirc.size == 0:
+        return M
+    Ly, Lx = M.shape[:2]
+    offsets = [(0, 0)]
+    if width >= 2:
+        offsets += [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    for dy, dx in offsets:
+        y = ycirc + dy
+        x = xcirc + dx
+        valid = (y >= 0) & (y < Ly) & (x >= 0) & (x < Lx)
+        M[y[valid], x[valid], 0] = color[0]
+        M[y[valid], x[valid], 1] = color[1]
+        M[y[valid], x[valid], 2] = color[2]
+        M[y[valid], x[valid], 3] = alpha
+    return M
+
+def roi_outline_color(parent, color_id, roi_id, fallback=(255, 0, 0)):
+    """Return the currently selected ROI color for an outline."""
+    try:
+        return parent.colors["cols"][color_id, roi_id]
+    except (KeyError, IndexError, TypeError):
+        return np.array(fallback, dtype=np.uint8)
+
+def draw_merged_masks(parent):
+    M = draw_masks(parent)
+    color = parent.ops_plot["color"]
+    if parent.merged_view_mode == 0:
+        M0 = M[0].copy()
+        for n in np.where(~parent.iscell)[0]:
+            outline_color = roi_outline_color(parent, color, n)
+            M0 = draw_outline(
+                M0,
+                parent.stat[n]["ycirc"],
+                parent.stat[n]["xcirc"],
+                color=outline_color,
+                alpha=255,
+                width=1,
+            )
+    else:
+        M0 = M[1].copy()
+        for n in np.where(parent.iscell)[0]:
+            outline_color = roi_outline_color(parent, color, n)
+            M0 = draw_outline(
+                M0,
+                parent.stat[n]["ycirc"],
+                parent.stat[n]["xcirc"],
+                color=outline_color,
+                alpha=255,
+                width=1,
+            )
+    for n in parent.imerge:
+        M0 = draw_outline(
+            M0,
+            parent.stat[n]["ycirc"],
+            parent.stat[n]["xcirc"],
+            color=(0, 255, 0),
+            alpha=255,
+            width=1,
+        )
+    return M0
+
+def plot_merged_mask(parent, M):
+    parent.color1.show()
+    parent.color2.show()
+    if parent.merged_view_mode == 0:
+        parent.color1.setImage(M, levels=(0.0, 255.0))
+
+    else:
+        parent.color2.setImage(M, levels=(0.0, 255.0))
