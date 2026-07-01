@@ -366,6 +366,11 @@ def load_to_GUI(parent, basename, procs):
                 parent.stat[n]["snr"] = snr[n]
         parent.stat[n]["inmerge"] = 0
     parent.stat = np.array(parent.stat)
+    try:
+        from suite2p.gui import masks
+        masks.load_stat_threshold_settings(parent, apply_thresholds=True)
+    except Exception as e:
+        print(f"Could not apply stat threshold settings: {e}")
     make_masks_and_enable_buttons(parent)
     parent.ichosen = 0
     parent.imerge = [0]

@@ -1,6 +1,7 @@
 """
 Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer and Marius Pachitariu.
 """
+import json
 from pathlib import Path
 import matplotlib.cm
 import numpy as np
@@ -13,6 +14,116 @@ import suite2p.gui.merge
 from . import io
 
 
+STAT_THRESHOLDS_FILENAME = "stat_thresholds.json"
+
+STAT_THRESHOLD_SPECS = {
+    "skew": {
+        "color_index": 1,
+        "direction": "min",
+        "tooltip": "Cell if skew >= this value. Leave empty to ignore skew.",
+    },
+    "compact": {
+        "color_index": 2,
+        "direction": "max",
+        "tooltip": "Cell if compact <= this value. Leave empty to ignore compact.",
+    },
+    "snr": {
+        "color_index": 3,
+        "direction": "min",
+        "tooltip": "Cell if snr >= this value. Leave empty to ignore snr.",
+    },
+    "aspect_ratio": {
+        "color_index": 4,
+        "direction": "max",
+        "tooltip": "Cell if aspect_ratio <= this value. Leave empty to ignore aspect_ratio.",
+    },
+}
+
+
+def _stat_thresholds_path(parent):
+    if not hasattr(parent, "basename") or parent.basename is None:
+        return None
+
+    return Path(parent.basename) / STAT_THRESHOLDS_FILENAME
+
+
+def save_stat_threshold_settings(parent):
+    path = _stat_thresholds_path(parent)
+
+    if path is None or not hasattr(parent, "stat_threshold_edits"):
+        return
+
+    thresholds = {}
+
+    for stat_name, edit in parent.stat_threshold_edits.items():
+        text = edit.text().strip()
+
+        if text == "":
+            continue
+
+        try:
+            thresholds[stat_name] = float(text)
+        except ValueError:
+            continue
+
+    settings = {
+        "version": 1,
+        "thresholds": thresholds,
+    }
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, sort_keys=True)
+    except OSError as e:
+        print(f"Could not save stat threshold settings: {e}")
+
+
+def load_stat_threshold_settings(parent, apply_thresholds=True):
+    if not hasattr(parent, "stat_threshold_edits"):
+        return
+
+    path = _stat_thresholds_path(parent)
+
+    for edit in parent.stat_threshold_edits.values():
+        edit.blockSignals(True)
+        edit.setText("")
+        edit.blockSignals(False)
+
+    if path is not None and path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+
+            thresholds = settings.get("thresholds", {})
+
+            for stat_name, value in thresholds.items():
+                if stat_name not in parent.stat_threshold_edits:
+                    continue
+
+                parent.stat_threshold_edits[stat_name].blockSignals(True)
+                parent.stat_threshold_edits[stat_name].setText(f"{float(value):g}")
+                parent.stat_threshold_edits[stat_name].blockSignals(False)
+
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            print(f"Could not load stat threshold settings: {e}")
+
+    if apply_thresholds:
+        apply_stat_thresholds(parent, save_settings=False)
+
+def _make_stat_threshold_edit(parent, stat_name, width):
+    edit = QLineEdit(parent)
+    edit.setText("")
+    edit.setPlaceholderText("off")
+    edit.setFixedWidth(width)
+    edit.setAlignment(QtCore.Qt.AlignRight)
+    edit.setValidator(QtGui.QDoubleValidator(edit))
+    edit.setToolTip(STAT_THRESHOLD_SPECS[stat_name]["tooltip"])
+
+    edit.returnPressed.connect(lambda: apply_stat_thresholds(parent))
+    edit.editingFinished.connect(lambda: apply_stat_thresholds(parent))
+
+    return edit
+
 def make_buttons(parent, b0):
     """ color buttons at row b0 """
     # color buttons
@@ -22,12 +133,14 @@ def make_buttons(parent, b0):
         "L: corr with 1D var, bin=^^^", "M: rastermap / custom"
     ]
     parent.colorbtns = QButtonGroup(parent)
+    parent.stat_threshold_edits = {}
     clabel = QLabel(parent)
     clabel.setText("<font color='white'>Colors</font>")
     clabel.setFont(parent.boldfont)
     parent.l0.addWidget(clabel, b0, 0, 1, 1)
 
     iwid = 65
+    stat_iwid = 55
 
     # add colormaps
     parent.CmapChooser = QComboBox()
@@ -46,14 +159,26 @@ def make_buttons(parent, b0):
     b = 0
     # colorbars for different statistics
     colorsAll = parent.color_names.copy()
+    threshold_color_ids = {
+        spec["color_index"]: name for name, spec in STAT_THRESHOLD_SPECS.items()
+    }
+
     for names in colorsAll:
         btn = ColorButton(b, "&" + names, parent)
         parent.colorbtns.addButton(btn, b)
-        if b > 4 and b < 8:
+        if b in threshold_color_ids or (b > 4 and b < 8):
             parent.l0.addWidget(btn, nv + b + 1, 0, 1, 1)
         else:
             parent.l0.addWidget(btn, nv + b + 1, 0, 1, 2)
+
         btn.setEnabled(False)
+
+        if b in threshold_color_ids:
+            stat_name = threshold_color_ids[b]
+            edit = _make_stat_threshold_edit(parent, stat_name, stat_iwid)
+            parent.stat_threshold_edits[stat_name] = edit
+            parent.l0.addWidget(edit, nv + b + 1, 1, 1, 1)
+
         parent.color_names[b] = parent.color_names[b][3:]
         b += 1
     parent.chan2edit = QLineEdit(parent)
@@ -187,6 +312,81 @@ def chan2_prob(parent):
         parent.update_plot()
         io.save_redcell(parent)
 
+def _stat_values(parent, stat_name):
+    values = np.full(len(parent.stat), np.nan, dtype=np.float32)
+
+    if len(parent.stat) == 0 or stat_name not in parent.stat[0]:
+        return None
+
+    for n, stat in enumerate(parent.stat):
+        try:
+            values[n] = float(stat[stat_name])
+        except (KeyError, TypeError, ValueError):
+            values[n] = np.nan
+
+    return values
+
+
+def apply_stat_thresholds(parent, save_settings=True):
+    if not getattr(parent, "loaded", False):
+        return
+
+    if not hasattr(parent, "stat_threshold_edits"):
+        return
+
+    active_thresholds = []
+
+    for stat_name, edit in parent.stat_threshold_edits.items():
+        text = edit.text().strip()
+
+        if text == "":
+            continue
+
+        try:
+            threshold = float(text)
+        except ValueError:
+            print(f"Ignoring invalid {stat_name} threshold: {text}")
+            continue
+
+        active_thresholds.append((stat_name, threshold))
+
+    if save_settings:
+        save_stat_threshold_settings(parent)
+
+    if len(active_thresholds) == 0:
+        return
+
+    iscell = np.ones(len(parent.stat), dtype=bool)
+    applied_any = False
+
+    for stat_name, threshold in active_thresholds:
+        values = _stat_values(parent, stat_name)
+
+        if values is None:
+            print(f"Skipping {stat_name} threshold: stat field not found")
+            continue
+
+        applied_any = True
+        valid = np.isfinite(values)
+
+        if STAT_THRESHOLD_SPECS[stat_name]["direction"] == "min":
+            passed = valid & (values >= threshold)
+        else:
+            passed = valid & (values <= threshold)
+
+        iscell &= passed
+
+    if not applied_any:
+        return
+
+    masks_changed = np.any(iscell != parent.iscell)
+
+    if not masks_changed:
+        return
+
+    flip_for_class(parent, iscell)
+    parent.update_plot()
+    io.save_iscell(parent)
 
 def make_colorbar(parent, b0):
     colorbarW = pg.GraphicsLayoutWidget(parent)
