@@ -6,11 +6,60 @@ import time
 
 from tqdm import trange
 import numpy as np
+import scipy.sparse
 from scipy.ndimage import filters, gaussian_filter
-import logging 
+import logging
 logger = logging.getLogger(__name__)
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 from .utils import circleMask
+
+# number of image rows smoothed at once on the GPU in getVmap
+# (128 rows x 608 px x 2472 components x 4 bytes ~ 0.8 GB per block)
+GPU_VMAP_ROWS = 128
+
+
+def masks_to_sparse(ypix, xpix, lam, Ly, Lx):
+    """
+    Build the ROI mask matrix as a sparse matrix of shape (Ly * Lx, nrois).
+
+    Equivalent to the dense ``L = np.zeros((Ly, Lx, nrois)); L[ypix[n], xpix[n], n] = lam[n]``
+    reshaped to (Ly * Lx, nrois), but without allocating Ly * Lx * nrois floats
+    (~19 GB for 4000 ROIs on a 2000 x 600 field of view).
+    """
+    rows, cols, vals = [], [], []
+    for n in range(len(ypix)):
+        idx = np.asarray(ypix[n], dtype=np.int64) * Lx + np.asarray(xpix[n], dtype=np.int64)
+        la = np.asarray(lam[n], dtype=np.float32)
+        # like fancy assignment, keep the last value for repeated pixels
+        _, last = np.unique(idx[::-1], return_index=True)
+        keep = len(idx) - 1 - last
+        rows.append(idx[keep])
+        cols.append(np.full(len(keep), n, dtype=np.int64))
+        vals.append(la[keep])
+    if rows:
+        rows, cols, vals = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+    else:
+        rows, cols, vals = (np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.float32))
+    return scipy.sparse.csc_matrix((vals, (rows, cols)), shape=(Ly * Lx, len(ypix)),
+                                   dtype=np.float32)
+
+
+def _gaussian_kernel1d(sigma, truncate=4.0):
+    """Same kernel as scipy.ndimage.gaussian_filter1d (order 0)."""
+    radius = int(truncate * float(sigma) + 0.5)
+    x = np.arange(-radius, radius + 1)
+    phi = np.exp(-0.5 / float(sigma) ** 2 * x ** 2)
+    return phi / phi.sum(), radius
+
+
+def _use_gpu(device):
+    return (torch is not None and device is not None and torch.device(device).type == "cuda"
+            and torch.cuda.is_available())
 
 
 def getSVDdata(mov: np.ndarray, diameter):
@@ -243,7 +292,52 @@ def localMax(V, footprint, thres):
 
 
 
-def getVmap(Ucell, sig):
+def getVmap_gpu(Ucell, sig, device, rows=GPU_VMAP_ROWS):
+    """
+    GPU version of getVmap: same smoothing (Gaussian, truncate 4.0, mode "wrap")
+    as scipy's gaussian_filter(Ucell, [sig[0], sig[1], 0.], mode="wrap").
+
+    Ucell is sent to the GPU in blocks of rows (with wrapped halo rows), which are
+    contiguous in memory, so the (Ly, Lx, nsvd) array does not have to fit on the
+    GPU and no transposed copies are needed.
+    """
+    Ly, Lx, nsvd = Ucell.shape
+    device = torch.device(device)
+    wy, ry = _gaussian_kernel1d(sig[0])
+    wx, rx = _gaussian_kernel1d(sig[1])
+    wy = [float(w) for w in wy]
+    wx = [float(w) for w in wx]
+    us = np.empty_like(Ucell)
+    mean_us2 = np.empty((Ly, Lx), np.float32)
+    mean_U2 = np.empty((Ly, Lx), np.float32)
+    for y0 in range(0, Ly, rows):
+        y1 = min(Ly, y0 + rows)
+        h = y1 - y0
+        if y0 - ry >= 0 and y1 + ry <= Ly:
+            block = Ucell[y0 - ry:y1 + ry]
+        else:
+            block = np.take(Ucell, np.arange(y0 - ry, y1 + ry) % Ly, axis=0)
+        x = torch.from_numpy(np.ascontiguousarray(block)).to(device)  # (h + 2 ry, Lx, nsvd)
+        mean_U2[y0:y1] = (x[ry:ry + h] ** 2).mean(dim=-1).cpu().numpy()
+        # scipy filters axis 0 (y) first, then axis 1 (x)
+        z = wy[0] * x[0:h]
+        for k in range(1, 2 * ry + 1):
+            z += wy[k] * x[k:k + h]
+        del x
+        if rx > 0:
+            zp = torch.cat((z[:, -rx:], z, z[:, :rx]), dim=1)
+            z = wx[0] * zp[:, 0:Lx]
+            for k in range(1, 2 * rx + 1):
+                z += wx[k] * zp[:, k:k + Lx]
+            del zp
+        mean_us2[y0:y1] = (z ** 2).mean(dim=-1).cpu().numpy()
+        us[y0:y1] = z.cpu().numpy()
+        del z
+    log_variances = mean_us2 / gaussian_filter(mean_U2, sig, mode="wrap")
+    return log_variances.astype("float64"), us
+
+
+def getVmap(Ucell, sig, device=None):
     """
     Compute the variance ratio map from SVD spatial components.
 
@@ -265,6 +359,8 @@ def getVmap(Ucell, sig):
     us : numpy.ndarray
         Smoothed spatial components of shape (Ly, Lx, nsvd).
     """
+    if _use_gpu(device):
+        return getVmap_gpu(Ucell, sig, device)
     us = gaussian_filter(Ucell, [sig[0], sig[1], 0.], mode="wrap")
     # compute log variance at each location
     log_variances = (us**2).mean(axis=-1) / gaussian_filter(
@@ -446,7 +542,7 @@ def iter_extend(ypix, xpix, Ucell, code, refine=-1, change_codes=False):
 
 
 def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
-             connected=True, max_iterations=20, smooth_masks=False):
+             connected=True, max_iterations=20, smooth_masks=False, device=None):
     """
     Detect ROIs using the Sourcery algorithm (SVD-based iterative detection).
 
@@ -473,6 +569,9 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
         Maximum number of detection and refinement iterations.
     smooth_masks : bool, optional (default False)
         If True, spatially smooth frames before SVD projection during refinement.
+    device : torch.device or str, optional (default None)
+        If a CUDA device is given and available, the smoothing in getVmap runs
+        on the GPU. Otherwise it runs on the CPU with scipy.
 
     Returns
     -------
@@ -501,7 +600,8 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
     codes = np.zeros((0, nsvd), np.float32)
     LtU = np.zeros((0, nsvd), np.float32)
     LtS = np.zeros((0, nbasis), np.float32)
-    L = np.zeros((Ly, Lx, 0), np.float32)
+    # ROI masks as a sparse (Ly * Lx, ncells) matrix (each ROI has only ~tens of pixels)
+    L = masks_to_sparse([], [], [], Ly, Lx)
     # regress maps onto basis functions and subtract neuropil contribution
     neu = np.linalg.solve(StS, StU).astype("float32")
     Ucell = U - (S.reshape((-1, nbasis)) @ neu).reshape(U.shape)
@@ -515,7 +615,7 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
     logger.info(f"max_iterations = {max_iterations}; will stop when no more peaks above threshold, or max_iterations reached")
     for it in range(max_iterations):
         if refine < 0:
-            V, us = getVmap(Ucell, sig)
+            V, us = getVmap(Ucell, sig, device=device)
             if it == 0:
                 vrem = morphOpen(V, rs <= 1.)
             V = V - vrem  # make V more uniform
@@ -552,17 +652,16 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
             newcells = len(ypix) - ncells
             if it == 0:
                 Nfirst = newcells
-            L = np.append(L, np.zeros((Ly, Lx, newcells), "float32"), axis=-1)
             LtU = np.append(LtU, np.zeros((newcells, nsvd), "float32"), axis=0)
             LtS = np.append(LtS, np.zeros((newcells, nbasis), "float32"), axis=0)
             for n in range(ncells, len(ypix)):
-                L[ypix[n], xpix[n], n] = lam[n]
                 LtU[n, :] = lam[n] @ U[ypix[n], xpix[n], :]
                 LtS[n, :] = lam[n] @ S[ypix[n], xpix[n], :]
             ncells += newcells
+            L = masks_to_sparse(ypix, xpix, lam, Ly, Lx)
 
             # regression with neuropil
-            LtL = L.reshape((-1, ncells)).transpose() @ L.reshape((-1, ncells))
+            LtL = (L.transpose() @ L).toarray().astype("float32")
             cellcode = np.concatenate((LtL, LtS), axis=1)
             neucode = np.concatenate((LtS.transpose(), StS), axis=1)
             codes = np.concatenate((cellcode, neucode), axis=0)
@@ -572,8 +671,7 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
             neu = codes[ncells:, :]
             codes = codes[:ncells, :]
 
-        Ucell = U - (S.reshape((-1, nbasis)) @ neu + L.reshape(
-            (-1, ncells)) @ codes).reshape(U.shape)
+        Ucell = U - (S.reshape((-1, nbasis)) @ neu + L @ codes).reshape(U.shape)
         # reestimate masks
         n, k = 0, 0
         while n < len(ypix):
@@ -589,11 +687,10 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
             n += 1
         codes = codes[:n, :]
         ncells = len(ypix)
-        L = np.zeros((Ly, Lx, ncells), "float32")
+        L = masks_to_sparse(ypix, xpix, lam, Ly, Lx)
         LtU = np.zeros((ncells, nsvd), "float32")
         LtS = np.zeros((ncells, nbasis), "float32")
         for n in range(ncells):
-            L[ypix[n], xpix[n], n] = lam[n]
             if refine < 0:
                 LtU[n, :] = lam[n] @ U[ypix[n], xpix[n], :]
                 LtS[n, :] = lam[n] @ S[ypix[n], xpix[n], :]

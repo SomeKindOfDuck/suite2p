@@ -215,6 +215,7 @@ def detection_wrapper(f_reg, diameter=[12., 12.], tau=1., fs=30, meanImg_chan2=N
         else:
             new_settings, stat = sourcery.sourcery(mov=mov, sdmov=sdmov, diameter=diameter,
                                               threshold_scaling=settings["threshold_scaling"],
+                                              device=device,
                                               **settings["sourcery_settings"])
     logger.info("Detected %d ROIs, %0.2f sec" % (len(stat), time.time() - t0))
     stat = np.array(stat)
