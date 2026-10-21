@@ -7,7 +7,9 @@ import json
 import math
 import os
 import time
-import logging 
+import logging
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 logger = logging.getLogger(__name__)
 
 import numpy as np
@@ -141,6 +143,53 @@ def read_tiff(file, tif, Ltif, ix, batch_size, use_sktiff):
 
     return im
 
+# Number of files to open and read ahead in background threads while converting.
+# With one frame per file (e.g. 25k single-page tiffs), per-file overhead dominates,
+# so reading ahead in parallel keeps the disk busy.
+TIFF_PREFETCH_WORKERS = 8
+# Run gc.collect() only once every this many files. Calling it after every file is
+# expensive when many Python objects are alive (~0.1 s per call with suite2p/torch
+# imported), which made converting 25k single-page tiffs take ~50 min longer.
+GC_EVERY_N_FILES = 1000
+
+
+def _open_and_read_first(file, use_sktiff, batch_size):
+    """Open a tiff and read its first batch (run in a background thread)."""
+    tif, Ltif = open_tiff(file, use_sktiff)
+    im = read_tiff(file, tif, Ltif, 0, batch_size, use_sktiff)
+    return tif, Ltif, im
+
+
+def _prefetched_tiffs(fs, use_sktiff, batch_size, nworkers=TIFF_PREFETCH_WORKERS):
+    """Yield (tif, Ltif, first batch) for each file in order, reading ahead in threads."""
+    if nworkers <= 1 or len(fs) <= 1:
+        for file in fs:
+            yield _open_and_read_first(file, use_sktiff, batch_size)
+        return
+    with ThreadPoolExecutor(max_workers=nworkers) as pool:
+        pending = deque()
+        it = iter(fs)
+        for file in it:
+            pending.append(pool.submit(_open_and_read_first, file, use_sktiff, batch_size))
+            if len(pending) >= 2 * nworkers:
+                break
+        while pending:
+            result = pending.popleft().result()
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append(pool.submit(_open_and_read_first, nxt, use_sktiff, batch_size))
+            yield result
+
+
+def _close_tiff(tif):
+    close = getattr(tif, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            pass
+
+
 def tiff_to_binary(dbs, settings, reg_file, reg_file_chan2):
     """
     Read TIFF files and write interleaved plane/channel data to binary files.
@@ -190,16 +239,20 @@ def tiff_to_binary(dbs, settings, reg_file, reg_file_chan2):
     which_folder = -1
     ntotal = 0
     swap = dbs[0].get("swap_order", False)
+    prefetch = _prefetched_tiffs(fs, use_sktiff, batch_size)
     for ifile, file in enumerate(fs):
-        # open tiff
-        tif, Ltif = open_tiff(file, use_sktiff)
+        # open tiff (opened and first batch read ahead in a background thread)
+        tif, Ltif, im_first = next(prefetch)
         # keep track of the plane identity of the first frame (channel identity is assumed always 0)
         if first_files[ifile]:
             which_folder += 1
             iplane = 0
         ix = 0
         while 1:
-            im = read_tiff(file, tif, Ltif, ix, batch_size, use_sktiff)
+            if ix == 0:
+                im, im_first = im_first, None
+            else:
+                im = read_tiff(file, tif, Ltif, ix, batch_size, use_sktiff)
             if im is None:
                 break          
             nframes = im.shape[0]
@@ -264,7 +317,10 @@ def tiff_to_binary(dbs, settings, reg_file, reg_file_chan2):
             if ntotal % (batch_size * 4) == 0:
                 logger.info("%d frames of binary, time %0.2f sec." %
                       (ntotal, time.time() - t0))
-        gc.collect()
+        _close_tiff(tif)
+        if (ifile + 1) % GC_EVERY_N_FILES == 0:
+            gc.collect()
+    gc.collect()
     # write dbs and settings files
     for db in dbs:
         db["meanImg"] /= db["nframes"]
