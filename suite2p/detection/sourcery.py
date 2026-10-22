@@ -264,11 +264,11 @@ def residual_maps(U, Sb, neu, L, codes, out=None):
     return out
 
 
-def mean_square(X, rows=64):
-    """(X**2).mean() computed in blocks of rows (only used for logging)."""
+def mean_square(X, rows=8):
+    """(X**2).mean() computed in blocks of rows, summed in float64 (only used for logging)."""
     total = 0.
     for y0 in range(0, X.shape[0], rows):
-        b = X[y0:y0 + rows].ravel()
+        b = X[y0:y0 + rows].astype(np.float64).ravel()
         total += float(np.dot(b, b))
     return total / X.size
 
