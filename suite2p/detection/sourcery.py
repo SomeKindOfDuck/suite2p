@@ -3,6 +3,7 @@ Copyright © 2023 Howard Hughes Medical Institute, Authored by Carsen Stringer a
 """
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from tqdm import trange
 import numpy as np
@@ -86,8 +87,7 @@ def getSVDdata(mov: np.ndarray, diameter):
     nbins, Lyc, Lxc = np.shape(mov)
 
     sig = diameter / 10.  # PICK UP
-    for j in range(nbins):
-        mov[j, :, :] = gaussian_filter(mov[j, :, :], sig)
+    _smooth_frames(mov, sig)  # mov[j] = gaussian_filter(mov[j], sig) for every frame
 
     # compute noise variance across frames
     mov = np.reshape(mov, (-1, Lyc * Lxc))
@@ -169,6 +169,120 @@ def getStU(diameter, U):
     StS = S.reshape((Lyc * Lxc, -1)).transpose() @ S.reshape((Lyc * Lxc, -1))
     #U = np.reshape(U, (-1,Lyc,Lxc))
     return S, StU, StS
+
+
+class NeuropilBasis:
+    """
+    The neuropil basis of create_neuropil_basis without building it.
+
+    Each basis function is an outer product of a function of y and a function of x,
+    S[:, ky * nX + kx] = outer(Ky[:, ky], Kx[:, kx]) / ||outer(...)||, so products with
+    S can be computed with the small (Ly, nY) and (Lx, nX) factors. For a 1978 x 608
+    field of view with diameter 3 there are 221 x 69 = 15249 basis functions, and the
+    dense S would be ~73 GB; S @ X costs ~300 times fewer operations this way.
+    """
+
+    def __init__(self, diameter, Ly, Lx, rows=64):
+        ratio_neuropil = 6.
+        tile_factor = 1.
+        ntilesY = 1 + 2 * int(
+            np.ceil(tile_factor * Ly / (ratio_neuropil * diameter[0] / 2)) / 2)
+        ntilesX = 1 + 2 * int(
+            np.ceil(tile_factor * Lx / (ratio_neuropil * diameter[1] / 2)) / 2)
+        ntilesY = int(np.maximum(2, ntilesY))
+        ntilesX = int(np.maximum(2, ntilesX))
+        ys = np.arange(0, Ly)
+        xs = np.arange(0, Lx)
+        Kx = np.ones((Lx, ntilesX), "float32")
+        Ky = np.ones((Ly, ntilesY), "float32")
+        for k in range(int((ntilesX - 1) / 2)):
+            Kx[:, 2 * k + 1] = np.sin(2 * math.pi * (xs + 0.5) * (1 + k) / Lx)
+            Kx[:, 2 * k + 2] = np.cos(2 * math.pi * (xs + 0.5) * (1 + k) / Lx)
+        for k in range(int((ntilesY - 1) / 2)):
+            Ky[:, 2 * k + 1] = np.sin(2 * math.pi * (ys + 0.5) * (1 + k) / Ly)
+            Ky[:, 2 * k + 2] = np.cos(2 * math.pi * (ys + 0.5) * (1 + k) / Ly)
+        # the norm of an outer product is the product of the norms
+        self.Ky = (Ky / np.sqrt((Ky**2).sum(axis=0))).astype("float32")
+        self.Kx = (Kx / np.sqrt((Kx**2).sum(axis=0))).astype("float32")
+        self.Ly, self.Lx, self.nY, self.nX = Ly, Lx, ntilesY, ntilesX
+        self.nbasis = ntilesY * ntilesX
+        self.rows = rows
+
+    def dense(self):
+        """Dense S of shape (Ly, Lx, nbasis) (for tests on small images)."""
+        S = self.Ky[:, None, :, None] * self.Kx[None, :, None, :]
+        return S.reshape(self.Ly, self.Lx, self.nbasis)
+
+    def pixel_rows(self, ypix, xpix):
+        """S[ypix, xpix, :] of shape (npix, nbasis)."""
+        return (self.Ky[ypix][:, :, None] * self.Kx[xpix][:, None, :]).reshape(len(ypix), -1)
+
+    def gram(self):
+        """S.T @ S of shape (nbasis, nbasis)."""
+        return np.kron(self.Ky.T @ self.Ky, self.Kx.T @ self.Kx).astype("float32")
+
+    def rmatmul(self, X):
+        """S.T @ X for X of shape (Ly, Lx, k); returns (nbasis, k)."""
+        k = X.shape[-1]
+        out = np.zeros((self.nY, self.nX, k), "float32")
+        for y0 in range(0, self.Ly, self.rows):
+            y1 = min(self.Ly, y0 + self.rows)
+            P = np.matmul(self.Kx.T[None], X[y0:y1])  # (h, nX, k)
+            out += np.tensordot(self.Ky[y0:y1], P, axes=([0], [0]))
+        return out.reshape(self.nbasis, k)
+
+    def add_matmul(self, X, coef, sign=1.):
+        """X += sign * (S @ coef) in place, for X of shape (Ly, Lx, k) and coef (nbasis, k)."""
+        k = X.shape[-1]
+        N = np.ascontiguousarray(coef.reshape(self.nY, self.nX, k), dtype="float32")
+        for y0 in range(0, self.Ly, self.rows):
+            y1 = min(self.Ly, y0 + self.rows)
+            M = np.tensordot(self.Ky[y0:y1], N, axes=([1], [0]))  # (h, nX, k)
+            R = np.matmul(self.Kx[None], M)  # (h, Lx, k)
+            if sign > 0:
+                X[y0:y1] += R
+            else:
+                X[y0:y1] -= R
+
+
+def residual_maps(U, Sb, neu, L, codes, out=None):
+    """
+    Compute U - (S @ neu + L @ codes) reshaped like U, without temporaries of the size of U.
+
+    Writes into `out` if given (and not U itself). L is the sparse (Ly * Lx, ncells) mask
+    matrix, so L @ codes is only computed for pixels that belong to an ROI.
+    """
+    if out is None or out is U or out.shape != U.shape:
+        out = np.empty_like(U)
+    np.copyto(out, U)
+    Sb.add_matmul(out, neu, sign=-1.)
+    if L.shape[1] > 0 and L.nnz > 0:
+        Lr = L.tocsr()
+        rows = np.flatnonzero(np.diff(Lr.indptr))
+        flat = out.reshape(-1, out.shape[-1])
+        flat[rows] -= np.asarray(Lr[rows] @ codes, dtype="float32")
+    return out
+
+
+def mean_square(X, rows=64):
+    """(X**2).mean() computed in blocks of rows (only used for logging)."""
+    total = 0.
+    for y0 in range(0, X.shape[0], rows):
+        b = X[y0:y0 + rows].ravel()
+        total += float(np.dot(b, b))
+    return total / X.size
+
+
+def _smooth_frames(mov, sig, nworkers=8):
+    """mov[j] = gaussian_filter(mov[j], sig) for every frame, in threads (same result)."""
+    def smooth(j):
+        mov[j] = gaussian_filter(mov[j], sig)
+    if nworkers <= 1:
+        for j in range(mov.shape[0]):
+            smooth(j)
+        return
+    with ThreadPoolExecutor(max_workers=nworkers) as pool:
+        list(pool.map(smooth, range(mov.shape[0])))
 
 
 def create_neuropil_basis(diameter, Ly, Lx):
@@ -292,7 +406,7 @@ def localMax(V, footprint, thres):
 
 
 
-def getVmap_gpu(Ucell, sig, device, rows=GPU_VMAP_ROWS):
+def getVmap_gpu(Ucell, sig, device, rows=GPU_VMAP_ROWS, keep_on_gpu=True):
     """
     GPU version of getVmap: same smoothing (Gaussian, truncate 4.0, mode "wrap")
     as scipy's gaussian_filter(Ucell, [sig[0], sig[1], 0.], mode="wrap").
@@ -300,14 +414,38 @@ def getVmap_gpu(Ucell, sig, device, rows=GPU_VMAP_ROWS):
     Ucell is sent to the GPU in blocks of rows (with wrapped halo rows), which are
     contiguous in memory, so the (Ly, Lx, nsvd) array does not have to fit on the
     GPU and no transposed copies are needed.
+
+    If keep_on_gpu and there is enough GPU memory, the smoothed components `us` are
+    returned as a torch tensor on the GPU (only a few hundred pixels of it are read
+    afterwards), which avoids copying ~12 GB back to the CPU. Otherwise `us` is a
+    numpy array.
     """
     Ly, Lx, nsvd = Ucell.shape
     device = torch.device(device)
+    if keep_on_gpu:
+        rows = min(rows, 64)  # smaller blocks, since us itself takes most of the GPU memory
+        need = Ucell.nbytes + 4 * (rows + 16) * Lx * nsvd * 4
+        free, _ = torch.cuda.mem_get_info(device)
+        keep_on_gpu = free > 1.05 * need
+    if keep_on_gpu:
+        try:
+            return _getVmap_gpu(Ucell, sig, device, rows, keep_on_gpu=True)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            logger.info("getVmap: not enough GPU memory to keep smoothed maps on the GPU")
+    return _getVmap_gpu(Ucell, sig, device, rows, keep_on_gpu=False)
+
+
+def _getVmap_gpu(Ucell, sig, device, rows, keep_on_gpu):
+    Ly, Lx, nsvd = Ucell.shape
     wy, ry = _gaussian_kernel1d(sig[0])
     wx, rx = _gaussian_kernel1d(sig[1])
     wy = [float(w) for w in wy]
     wx = [float(w) for w in wx]
-    us = np.empty_like(Ucell)
+    if keep_on_gpu:
+        us = torch.empty((Ly, Lx, nsvd), dtype=torch.float32, device=device)
+    else:
+        us = np.empty_like(Ucell)
     mean_us2 = np.empty((Ly, Lx), np.float32)
     mean_U2 = np.empty((Ly, Lx), np.float32)
     for y0 in range(0, Ly, rows):
@@ -331,10 +469,20 @@ def getVmap_gpu(Ucell, sig, device, rows=GPU_VMAP_ROWS):
                 z += wx[k] * zp[:, k:k + Lx]
             del zp
         mean_us2[y0:y1] = (z ** 2).mean(dim=-1).cpu().numpy()
-        us[y0:y1] = z.cpu().numpy()
+        if keep_on_gpu:
+            us[y0:y1] = z
+        else:
+            us[y0:y1] = z.cpu().numpy()
         del z
     log_variances = mean_us2 / gaussian_filter(mean_U2, sig, mode="wrap")
     return log_variances.astype("float64"), us
+
+
+def us_at(us, i, j):
+    """us[i, j, :] as a numpy array, for us from getVmap (numpy array or GPU tensor)."""
+    if torch is not None and isinstance(us, torch.Tensor):
+        return us[i, j].cpu().numpy()
+    return us[i, j, :]
 
 
 def getVmap(Ucell, sig, device=None):
@@ -356,8 +504,9 @@ def getVmap(Ucell, sig, device=None):
     -------
     log_variances : numpy.ndarray
         Variance ratio map of shape (Ly, Lx), dtype float64.
-    us : numpy.ndarray
-        Smoothed spatial components of shape (Ly, Lx, nsvd).
+    us : numpy.ndarray or torch.Tensor
+        Smoothed spatial components of shape (Ly, Lx, nsvd). A torch tensor on the
+        GPU when computed there and it fits; read single pixels with `us_at`.
     """
     if _use_gpu(device):
         return getVmap_gpu(Ucell, sig, device)
@@ -584,19 +733,22 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
         "xpix", and "lam".
     """
     mov /= sdmov
-    
+
     change_codes = True
     t0 = time.time()
-    
+
     U, u = getSVDdata(mov=mov, diameter=diameter)  # get SVD components
-    S, StU, StS = getStU(diameter, U)
     Ly, Lx, nsvd = U.shape
+    # neuropil basis S (Ly, Lx, nbasis), kept as the product of y and x factors
+    Sb = NeuropilBasis(diameter, Ly, Lx)
+    StU = Sb.rmatmul(U)
+    StS = Sb.gram()
     d0 = diameter
     sig = np.ceil(d0 / 4)  # smoothing constant
     # make array of radii values of size (2*d0+1,2*d0+1)
     rs, dy, dx = circleMask(d0)
     nsvd = U.shape[-1]
-    nbasis = S.shape[-1]
+    nbasis = Sb.nbasis
     codes = np.zeros((0, nsvd), np.float32)
     LtU = np.zeros((0, nsvd), np.float32)
     LtS = np.zeros((0, nbasis), np.float32)
@@ -604,7 +756,7 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
     L = masks_to_sparse([], [], [], Ly, Lx)
     # regress maps onto basis functions and subtract neuropil contribution
     neu = np.linalg.solve(StS, StU).astype("float32")
-    Ucell = U - (S.reshape((-1, nbasis)) @ neu).reshape(U.shape)
+    Ucell = residual_maps(U, Sb, neu, L, codes)
 
     it = 0
     ncells = 0
@@ -638,17 +790,17 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
                 i, j = np.unravel_index(ind, V.shape)
                 if V[i, j] < thres:
                     break
-                yp, xp, la, ix, code = iter_extend(i, j, Ucell, us[i, j, :],
+                yp, xp, la, ix, code = iter_extend(i, j, Ucell, us_at(us, i, j),
                                                    change_codes=change_codes)
-                codes = np.append(codes, np.expand_dims(code, axis=0), axis=0)
                 ypix.append(yp)
                 xpix.append(xp)
                 lam.append(la)
-                Ucell[ypix[n], xpix[n], :] -= np.outer(lam[n], codes[n, :])
+                Ucell[ypix[n], xpix[n], :] -= np.outer(lam[n], code)
 
                 yp, xp = extendROI(yp, xp, Ly, Lx, int(np.mean(d0)))
                 V[yp, xp] = 0
                 n += 1
+            del us
             newcells = len(ypix) - ncells
             if it == 0:
                 Nfirst = newcells
@@ -656,7 +808,7 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
             LtS = np.append(LtS, np.zeros((newcells, nbasis), "float32"), axis=0)
             for n in range(ncells, len(ypix)):
                 LtU[n, :] = lam[n] @ U[ypix[n], xpix[n], :]
-                LtS[n, :] = lam[n] @ S[ypix[n], xpix[n], :]
+                LtS[n, :] = lam[n] @ Sb.pixel_rows(ypix[n], xpix[n])
             ncells += newcells
             L = masks_to_sparse(ypix, xpix, lam, Ly, Lx)
 
@@ -671,7 +823,8 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
             neu = codes[ncells:, :]
             codes = codes[:ncells, :]
 
-        Ucell = U - (S.reshape((-1, nbasis)) @ neu + L @ codes).reshape(U.shape)
+        # Ucell = U - (S @ neu + L @ codes), reusing the Ucell buffer (unless it is U)
+        Ucell = residual_maps(U, Sb, neu, L, codes, out=Ucell)
         # reestimate masks
         n, k = 0, 0
         while n < len(ypix):
@@ -693,8 +846,8 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
         for n in range(ncells):
             if refine < 0:
                 LtU[n, :] = lam[n] @ U[ypix[n], xpix[n], :]
-                LtS[n, :] = lam[n] @ S[ypix[n], xpix[n], :]
-        err = (Ucell**2).mean()
+                LtS[n, :] = lam[n] @ Sb.pixel_rows(ypix[n], xpix[n])
+        err = mean_square(Ucell)
         t1 = time.time() - t0
         logger.info(f"iter {it},\tROIs: {ncells},\terr: {err:0.4f}, \ttime: {t1:0.2f} sec")
 
@@ -713,18 +866,21 @@ def sourcery(mov: np.ndarray, sdmov, diameter, threshold_scaling=1.0,
             lam = [stat[n]["lam"] for n in range(len(stat))]
             ncells = len(ypix)
         if refine > 0:
-            Ucell = Ucell + (S.reshape((-1, nbasis)) @ neu).reshape(U.shape)
+            # Ucell = Ucell + S @ neu
+            if Ucell is U:
+                Ucell = U.copy()
+            Sb.add_matmul(Ucell, neu, sign=1.)
         if refine < 0 and (newcells < Nfirst / 10 or it == max_iterations - 1):
             refine = 3
             U = getSVDproj(mov, u, diameter, smooth_masks)
             Ucell = U
         if refine >= 0:
-            StU = S.reshape((Ly * Lx, -1)).transpose() @ Ucell.reshape(
-                (Ly * Lx, -1))
-            #StU = np.reshape(S, (Lyc*Lxc,-1)).transpose() @ np.reshape(Ucell, (Lyc*Lxc, -1))
+            StU = Sb.rmatmul(Ucell)
             neu = np.linalg.solve(StS, StU).astype("float32")
         refine -= 1
-    Ucell = U - (S.reshape((-1, nbasis)) @ neu).reshape(U.shape)
+    # (the original recomputed Ucell = U - S @ neu here, but it is not used afterwards)
+    if _use_gpu(device):
+        torch.cuda.empty_cache()
 
     sdmov = np.reshape(sdmov, (Ly, Lx))
     stat = [{
